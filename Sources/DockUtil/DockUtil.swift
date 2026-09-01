@@ -12,6 +12,17 @@ import Darwin
 
 let VERSION = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
 var gv = 0 // Global verbosity
+let log = FileLog(tool: "dockutil") // Audit trail for dock mutations; console output is unchanged
+
+/// Describes where an item is being placed, for the log line.
+func describePlacement(position: String?, before: String?, after: String?, replacing: String? = nil) -> String {
+    var parts = [String]()
+    if let replacing = replacing { parts.append("replacing=\(replacing)") }
+    if let position = position { parts.append("position=\(position)") }
+    if let before = before { parts.append("before=\(before)") }
+    if let after = after { parts.append("after=\(after)") }
+    return parts.isEmpty ? "position=end" : parts.joined(separator: " ")
+}
 
 struct DockAdditionOptions {
     var path: String
@@ -320,6 +331,7 @@ struct Dockutil: ParsableCommand {
         gv > 0 ? print("Plist paths:", plistPaths):nil
                 
         if plistPaths.count < 1 {
+            log.error("no dock plists were found (allhomes=\(allhomes) homeloc=\(homeloc))")
             throw(ValidationError("no dock plists were found"))
         }
         
@@ -345,6 +357,7 @@ struct Dockutil: ParsableCommand {
                     gv > 0 ? print("Skipping:", plistPath, "does not seem to be a home directory or a dock plist"):nil
                     continue
                 } else {
+                    log.error("\(plistPath) does not seem to be a home directory or a dock plist")
                     throw(ValidationError("\(plistPath) does not seem to be a home directory or a dock plist"))
                 }
             }
@@ -364,13 +377,17 @@ struct Dockutil: ParsableCommand {
 
             if move != nil {
                 if position == nil && after == nil && before == nil {
+                    log.error("move \(move!) plist=\(plistPath) result=failed reason=no position given")
                     throw ValidationError("Please specify a 'position' for the move")
                 }
                 
+                let placement = describePlacement(position: position, before: before, after: after)
                 if dock.moveItem(move!, position: position, before: before, after: after) {
                     dockWasModified = true
+                    log.info("move \(move!) \(placement) plist=\(plistPath) result=ok")
                 } else {
                     print("Move failed for \(move!)")
+                    log.error("move \(move!) \(placement) plist=\(plistPath) result=failed reason=item not found")
                     errors.append("Move failed for \(move!) in \(plistPath)")
                 }
             }
@@ -379,7 +396,9 @@ struct Dockutil: ParsableCommand {
                 for removal in removals {
                     if dock.removeItem(removal) {
                         dockWasModified = true
+                        log.info("remove \(removal) plist=\(plistPath) result=ok")
                     } else {
+                        log.error("remove \(removal) plist=\(plistPath) result=failed reason=item not found")
                         errors.append("Remove failed for \(removal) in \(plistPath)")
                     }
                 }
@@ -477,10 +496,14 @@ struct Dockutil: ParsableCommand {
                         label: label
                     )
                     
+                    let placement = describePlacement(position: position, before: before, after: after, replacing: replacing)
+                    let details = "label=\(label ?? "-") section=\(section.rawValue) type=\(tileType.rawValue) \(placement) plist=\(plistPath)"
                     if dock.add(additionOptions) {
                         dockWasModified = true
+                        log.info("add \(addition) \(details) result=ok")
                     } else {
                         print("item", addition, "was not added to Dock")
+                        log.error("add \(addition) \(details) result=failed")
                         errors.append("Add failed for \(addition) in \(plistPath)")
                     }
 
