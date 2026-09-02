@@ -90,12 +90,48 @@ final class FileLogTests: XCTestCase {
         }
     }
 
-    func testDefaultPathForUnprivilegedUser() {
-        if FileLog.isRoot {
-            XCTAssertEqual(FileLog.defaultPath(tool: "tool"), "/Library/Managed Utilities/logs/tool.log")
+    func testDefaultPathPrefersWritableSharedDirectory() {
+        let path = FileLog.defaultPath(tool: "tool")
+        if FileLog.sharedDirectoryIsWritable() {
+            XCTAssertEqual(path, "/Library/Managed Utilities/logs/tool.log")
         } else {
-            XCTAssertTrue(FileLog.defaultPath(tool: "tool").hasSuffix("/Library/Logs/tool.log"))
-            XCTAssertFalse(FileLog.defaultPath(tool: "tool").hasPrefix("/Library/"))
+            XCTAssertEqual(path, FileLog.userPath(tool: "tool"))
+            XCTAssertTrue(path.hasSuffix("/Library/Logs/tool.log"))
+            XCTAssertFalse(path.hasPrefix("/Library/"))
         }
+    }
+
+    func testCreatedFileIsWorldWritable() throws {
+        let log = FileLog(path: logPath)
+        log.write(.info, "hello")
+        let attributes = try FileManager.default.attributesOfItem(atPath: logPath)
+        XCTAssertEqual(((attributes[.posixPermissions] as? Int) ?? 0) & 0o777, 0o666)
+    }
+
+    func testFallsBackWhenPreferredPathIsNotWritable() throws {
+        try XCTSkipIf(FileLog.isRoot, "root can write anywhere")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let blocked = directory.appendingPathComponent("blocked", isDirectory: true)
+        try FileManager.default.createDirectory(at: blocked, withIntermediateDirectories: false,
+                                                attributes: [.posixPermissions: 0o555])
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: blocked.path) }
+        let preferred = blocked.appendingPathComponent("tool.log").path
+        let log = FileLog(path: preferred, fallbackPath: logPath)
+        log.write(.info, "one")
+        log.write(.warn, "two")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: preferred))
+        XCTAssertEqual(log.activePath, logPath)
+        let contents = try String(contentsOfFile: logPath, encoding: .utf8)
+        XCTAssertTrue(contents.contains("  INFO  one\n") && contents.hasSuffix("  WARN  two\n"), "unexpected: \(contents)")
+    }
+
+    func testRefusesSymlinkTarget() throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let victim = directory.appendingPathComponent("victim.txt").path
+        FileManager.default.createFile(atPath: victim, contents: Data("keep\n".utf8))
+        try FileManager.default.createSymbolicLink(atPath: logPath, withDestinationPath: victim)
+        let log = FileLog(path: logPath)
+        log.write(.info, "attack")
+        XCTAssertEqual(try String(contentsOfFile: victim, encoding: .utf8), "keep\n")
     }
 }

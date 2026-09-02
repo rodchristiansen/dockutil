@@ -31,7 +31,18 @@ jobs:
           rm -rf "$root" artifacts && mkdir -p "$root/usr/local/bin" artifacts
           cp .build/apple/Products/Release/dockutil "$root/usr/local/bin/dockutil"
           chmod 755 "$root/usr/local/bin/dockutil"
-          pkgbuild --root "$root" --identifier dockutil.cli.tool --version "$VERSION" \
+          scripts="$PWD/pkg/scripts"
+          rm -rf "$scripts" && mkdir -p "$scripts"
+          cat > "$scripts/postinstall" <<'POST'
+          #!/bin/bash
+          logs="/Library/Managed Utilities/logs"
+          /usr/bin/install -d -m 1777 -o root -g wheel "$logs"
+          /bin/chmod 1777 "$logs"
+          /bin/chmod 666 "$logs"/dockutil.log* 2>/dev/null || true
+          exit 0
+          POST
+          chmod 755 "$scripts/postinstall"
+          pkgbuild --root "$root" --scripts "$scripts" --identifier dockutil.cli.tool --version "$VERSION" \
             --install-location / "artifacts/dockutil-component.pkg"
           productbuild --package "artifacts/dockutil-component.pkg" --identifier dockutil.cli.tool \
             --version "$VERSION" "artifacts/dockutil-${VERSION}.pkg"
