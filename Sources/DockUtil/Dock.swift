@@ -76,6 +76,7 @@ class Dock {
                         
             guard let dict = try? PropertyListSerialization.propertyList(from: defaultsExportData, options: .mutableContainersAndLeaves, format: nil) as? [String:AnyObject] else {
                 print("failed to deserialize plist", self.path)
+                log.error("read \(self.path) result=failed reason=defaults export could not be deserialized (status \(p.terminationStatus))")
                 return
             }
             
@@ -103,7 +104,11 @@ class Dock {
                 }
             }
             
-            CFPreferencesSynchronize(dockDomain as CFString, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
+            if CFPreferencesSynchronize(dockDomain as CFString, kCFPreferencesCurrentUser, kCFPreferencesAnyHost) {
+                log.info("save \(path) method=cfpreferences restart=\(restart) result=ok")
+            } else {
+                log.error("save \(path) method=cfpreferences result=failed reason=CFPreferencesSynchronize returned false")
+            }
             
             if restart {
                 self.terminate()
@@ -113,6 +118,7 @@ class Dock {
             gv > 0 ? print("Handling dock while running as \(ProcessInfo.processInfo.userName)"):nil
             if ProcessInfo.processInfo.userName.lowercased() != "root" {
                 print("Warning: dockutil is not running as the user of this Dock nor root so dockutil may be unable to save the change or set the proper owner")
+                log.warn("save \(path) running as \(ProcessInfo.processInfo.userName), neither the dock owner nor root; the save may fail or leave the wrong owner")
             }
             for section in sections {
                 if let sectionItems = self.dockItems[section] {
@@ -124,6 +130,7 @@ class Dock {
             }
             guard let originalOwnerID = try? FileManager.default.attributesOfItem(atPath: self.path)[.ownerAccountID] as? Int else {
                 print("unable to get owner of plist", self.path)
+                log.error("save \(path) result=failed reason=unable to read plist owner")
                 return
             }
                         
@@ -133,6 +140,7 @@ class Dock {
 
             guard let plistData = try? PropertyListSerialization.data(fromPropertyList: plist, format: .binary, options: 0) else {
                 print("unable to serialize plist to data")
+                log.error("save \(path) result=failed reason=unable to serialize plist")
                 return
             }
                         
@@ -148,6 +156,11 @@ class Dock {
                 stdInPipe.fileHandleForWriting.closeFile()
                 p.waitUntilExit()
                 gv > 0 ? print(p.terminationStatus):nil
+                if p.terminationStatus == 0 {
+                    log.info("save \(path) method=defaults-as-uid-\(originalOwnerID) restart=\(restart) result=ok")
+                } else {
+                    log.error("save \(path) method=defaults-as-uid-\(originalOwnerID) result=failed reason=defaults import exited \(p.terminationStatus)")
+                }
             } else {
                 gv > 0 ? print("Unable to run as user \(originalOwnerID). Using defaults to write to dock (will attempt to chown after)"):nil
                 let p = Process()
@@ -160,11 +173,17 @@ class Dock {
                 stdInPipe.fileHandleForWriting.closeFile()
                 p.waitUntilExit()
                 gv > 0 ? print(p.arguments, p.terminationStatus):nil
+                if p.terminationStatus == 0 {
+                    log.info("save \(path) method=defaults restart=\(restart) result=ok")
+                } else {
+                    log.error("save \(path) method=defaults result=failed reason=defaults import exited \(p.terminationStatus)")
+                }
                 gv > 0 ? print("Changing owner to original owner \(String(originalOwnerID))"):nil
                 do {
                     try FileManager.default.setAttributes([.ownerAccountID: originalOwnerID], ofItemAtPath: self.path) // chown to original owner
                 } catch {
                     print("Failed to set owner to original owner \(String(originalOwnerID))")
+                    log.error("chown \(path) uid=\(originalOwnerID) result=failed reason=\(error.localizedDescription)")
                 }
             }
 
@@ -230,9 +249,14 @@ class Dock {
                 try p.run()
             } catch {
                 print(error)
+                log.error("restart dock result=failed reason=\(error.localizedDescription)")
+                return
             }
             p.waitUntilExit()
             gv > 0 ? print(p.arguments, p.terminationStatus):nil
+            if p.terminationStatus != 0 {
+                log.warn("restart dock method=killall result=exited \(p.terminationStatus)")
+            }
         }
     }
 
