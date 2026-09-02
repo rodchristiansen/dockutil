@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version from tag
+        id: ver
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build universal binary
+        run: swift build -c release --product dockutil --arch arm64 --arch x86_64
+
+      - name: Build unsigned package
+        env:
+          VERSION: ${{ steps.ver.outputs.VERSION }}
+        run: |
+          set -euo pipefail
+          root="$PWD/pkg/root"
+          rm -rf "$root" artifacts && mkdir -p "$root/usr/local/bin" artifacts
+          cp .build/apple/Products/Release/dockutil "$root/usr/local/bin/dockutil"
+          chmod 755 "$root/usr/local/bin/dockutil"
+          pkgbuild --root "$root" --identifier dockutil.cli.tool --version "$VERSION" \
+            --install-location / "artifacts/dockutil-component.pkg"
+          productbuild --package "artifacts/dockutil-component.pkg" --identifier dockutil.cli.tool \
+            --version "$VERSION" "artifacts/dockutil-${VERSION}.pkg"
+          rm -f artifacts/dockutil-component.pkg
+          shasum -a 256 "artifacts/dockutil-${VERSION}.pkg" > "artifacts/dockutil-${VERSION}.pkg.sha256"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: dockutil ${{ steps.ver.outputs.VERSION }}
+          body: Unsigned package built from this tag. Sign and notarize it with your own Developer ID before deployment.
+          files: |
+            artifacts/dockutil-${{ steps.ver.outputs.VERSION }}.pkg
+            artifacts/dockutil-${{ steps.ver.outputs.VERSION }}.pkg.sha256
