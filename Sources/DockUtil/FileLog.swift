@@ -4,13 +4,17 @@
 //  Append-only file log for small utilities that are invoked by scripts and
 //  packages. Console output is unchanged; this file is the audit trail.
 //
-//  Location   /Library/Managed Utilities/logs/<tool>.log whenever that shared
-//             directory is writable by the calling process. The installer
-//             creates it root:wheel mode 1777 (world-writable, sticky) so a
-//             root-context run and a user-context run append to the same
-//             file; a root-context run also creates it that way if it is
-//             missing. When the directory is absent or not writable, or the
-//             file cannot be opened, the log falls back to
+//  Location   /Library/Managed Utilities/logs/<yyyy-MM-dd>/<tool>.log whenever
+//             that shared directory is writable by the calling process. A
+//             utility is invoked too often to justify a directory per run, so
+//             the day directory is its session: the tool's lines go to
+//             <tool>.log and their structured form to events.jsonl beside it,
+//             shared by every tool writing into that root. The installer
+//             creates the root root:wheel mode 1777 (world-writable, sticky)
+//             so a root-context run and a user-context run append to the same
+//             files, and day directories are created the same way by whichever
+//             context gets there first. When the directory is absent or not
+//             writable, or the file cannot be opened, the log falls back to
 //             ~/Library/Logs/<tool>.log.
 //  Line       [yyyy-MM-dd HH:mm:ss] LEVEL  message   (local time, level
 //             left-padded to five characters: DEBUG, INFO, WARN, ERROR)
@@ -47,6 +51,8 @@ public final class FileLog: @unchecked Sendable {
     public static let defaultMaxBytes = 5 * 1024 * 1024
     public static let defaultGenerations = 5
     public static let rootDirectory = "/Library/Managed Utilities/logs"
+    /// Day directories older than this are removed the first time a process logs.
+    public static let retentionDays = 30
     public static let sharedDirectoryMode: mode_t = 0o1777
     public static let sharedFileMode: mode_t = 0o666
 
@@ -59,16 +65,34 @@ public final class FileLog: @unchecked Sendable {
 
     private let lock = NSLock()
     private let formatter: DateFormatter
+    private let dayFormatter: DateFormatter
     private var fellBack = false
+    /// The tool name, used to label records and, when this log resolves its own
+    /// path, to build it. A log constructed with an explicit path keeps that
+    /// path and never re-resolves.
+    private let tool: String?
+    private let resolvesPath: Bool
+    /// Where the last record went. Re-resolved per write for a tool log, so a
+    /// process still running at midnight rolls onto the new day directory.
+    private var resolved: String
+    /// Distinguishes this process's records from another's in a file several
+    /// invocations share.
+    private let invocation = UUID().uuidString
+    private static var pruned = false
+    private static let pruneLock = NSLock()
 
     /// Logs to the conventional location for `tool` (see the header).
     public convenience init(tool: String) {
-        self.init(path: FileLog.defaultPath(tool: tool), fallbackPath: FileLog.userPath(tool: tool))
+        self.init(path: FileLog.defaultPath(tool: tool), fallbackPath: FileLog.userPath(tool: tool),
+                  tool: tool, resolvesPath: true)
     }
 
     /// Logs to an explicit path. `maxBytes` and `generations` exist for tests.
-    public init(path: String, fallbackPath: String? = nil, maxBytes: Int = FileLog.defaultMaxBytes, generations: Int = FileLog.defaultGenerations) {
+    public init(path: String, fallbackPath: String? = nil, maxBytes: Int = FileLog.defaultMaxBytes, generations: Int = FileLog.defaultGenerations, tool: String? = nil, resolvesPath: Bool = false) {
         self.path = path
+        self.tool = tool
+        self.resolvesPath = resolvesPath
+        self.resolved = path
         self.fallbackPath = (fallbackPath == path) ? nil : fallbackPath
         self.maxBytes = Swift.max(1, maxBytes)
         self.generations = Swift.max(0, generations)
@@ -77,22 +101,67 @@ public final class FileLog: @unchecked Sendable {
         formatter.timeZone = TimeZone.current
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
         self.formatter = formatter
+        let dayFormatter = DateFormatter()
+        dayFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dayFormatter.timeZone = TimeZone.current
+        dayFormatter.dateFormat = "yyyy-MM-dd"
+        self.dayFormatter = dayFormatter
     }
 
     /// Where records currently go: `path`, or `fallbackPath` after a fallback.
     public var activePath: String {
         lock.lock()
         defer { lock.unlock() }
-        return fellBack ? (fallbackPath ?? path) : path
+        return fellBack ? (fallbackPath ?? path) : resolved
     }
 
     /// The shared path when the shared directory can be written by this
     /// process (root creates it if missing), otherwise the per-user path.
-    public static func defaultPath(tool: String) -> String {
+    /// The shared form is day-nested: the day directory is the utility tier's
+    /// session, and every tool writing into the root shares it.
+    public static func defaultPath(tool: String, date: Date = Date()) -> String {
         if sharedDirectoryIsWritable() {
-            return rootDirectory + "/" + tool + ".log"
+            return rootDirectory + "/" + dayName(date) + "/" + tool + ".log"
         }
         return userPath(tool: tool)
+    }
+
+    /// The day directory's name, `yyyy-MM-dd` in local time.
+    public static func dayName(_ date: Date = Date()) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone.current
+        f.dateFormat = "yyyy-MM-dd"
+        return f.string(from: date)
+    }
+
+    /// The structured stream beside a log file: one JSON object per line,
+    /// shared by every tool writing into that directory.
+    public static func eventsPath(besides target: String) -> String {
+        return (target as NSString).deletingLastPathComponent + "/events.jsonl"
+    }
+
+    /// Removes day directories under `rootDirectory` older than the retention
+    /// window. Best-effort: in the shared sticky root another context's
+    /// directories are not this process's to remove.
+    @discardableResult
+    public static func pruneDayDirectories(in directory: String = rootDirectory, now: Date = Date()) -> Int {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(atPath: directory),
+              let cutoff = Calendar.current.date(byAdding: .day, value: -retentionDays, to: now) else { return 0 }
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone.current
+        f.dateFormat = "yyyy-MM-dd"
+        var removed = 0
+        for entry in entries {
+            guard let day = f.date(from: entry), day < cutoff else { continue }
+            let full = (directory as NSString).appendingPathComponent(entry)
+            var isDirectory: ObjCBool = false
+            guard fm.fileExists(atPath: full, isDirectory: &isDirectory), isDirectory.boolValue else { continue }
+            if (try? fm.removeItem(atPath: full)) != nil { removed += 1 }
+        }
+        return removed
     }
 
     public static func userPath(tool: String) -> String {
@@ -142,15 +211,50 @@ public final class FileLog: @unchecked Sendable {
     public func write(_ level: Level, _ message: String, date: Date = Date()) {
         lock.lock()
         defer { lock.unlock() }
+        if resolvesPath, let tool = tool, !fellBack {
+            // Re-resolved every record, so a process still running at midnight
+            // rolls onto the new day directory rather than the one it started in.
+            resolved = FileLog.defaultPath(tool: tool, date: date)
+        }
         let line = FileLog.formatLine(level: level, message: message, timestamp: formatter.string(from: date))
         guard let data = line.data(using: .utf8) else { return }
-        if !fellBack, append(data, to: path) {
+        if !fellBack, append(data, to: resolved) {
+            writeEvent(level: level, message: message, date: date, beside: resolved)
             return
         }
         guard let fallback = fallbackPath else { return }
         fellBack = true
-        _ = append(data, to: fallback)
+        if append(data, to: fallback) {
+            writeEvent(level: level, message: message, date: date, beside: fallback)
+        }
     }
+
+    /// Appends the same record to events.jsonl beside the log. Utilities share
+    /// one stream per directory, so each record names its tool, its process and
+    /// the invocation that wrote it.
+    private func writeEvent(level: Level, message: String, date: Date, beside target: String) {
+        guard let toolName = tool else { return }
+        let record: [String: String] = [
+            "timestamp": FileLog.isoFormatter.string(from: date),
+            "level": level.rawValue,
+            "event_type": level == .error ? "error" : "message",
+            "tool": toolName,
+            "pid": String(getpid()),
+            "invocation_id": invocation,
+            "message": message
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]),
+              var line = String(data: data, encoding: .utf8) else { return }
+        line += "\n"
+        guard let payload = line.data(using: .utf8) else { return }
+        _ = append(payload, to: FileLog.eventsPath(besides: target))
+    }
+
+    static let isoFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
 
     /// Builds one log line. Newlines inside `message` are flattened so a
     /// line in the file is always one record.
@@ -170,6 +274,24 @@ public final class FileLog: @unchecked Sendable {
         let directory = (target as NSString).deletingLastPathComponent
         if directory == FileLog.rootDirectory {
             FileLog.ensureSharedDirectory()
+            return
+        }
+        // A day directory inside the shared root is created world-writable and
+        // sticky like the root itself, by whichever context gets there first,
+        // so every other context can write its own records into it. Retention
+        // runs once per process, the first time it needs the directory.
+        if (directory as NSString).deletingLastPathComponent == FileLog.rootDirectory {
+            FileLog.ensureSharedDirectory()
+            var info = stat()
+            if stat(directory, &info) != 0 {
+                if mkdir(directory, FileLog.sharedDirectoryMode) == 0 {
+                    chmod(directory, FileLog.sharedDirectoryMode)
+                    if FileLog.isRoot { chown(directory, 0, 0) }
+                }
+            } else if (info.st_mode & 0o7777) != FileLog.sharedDirectoryMode, info.st_uid == geteuid() {
+                chmod(directory, FileLog.sharedDirectoryMode)
+            }
+            FileLog.pruneOnce()
             return
         }
         var isDirectory: ObjCBool = false
@@ -224,6 +346,15 @@ public final class FileLog: @unchecked Sendable {
             fchmod(descriptor, FileLog.sharedFileMode)
         }
         return descriptor
+    }
+
+    /// Runs retention the first time this process writes into the shared root.
+    private static func pruneOnce() {
+        pruneLock.lock()
+        defer { pruneLock.unlock() }
+        guard !pruned else { return }
+        pruned = true
+        pruneDayDirectories()
     }
 
     private func mayRotate(_ descriptor: Int32) -> Bool {
