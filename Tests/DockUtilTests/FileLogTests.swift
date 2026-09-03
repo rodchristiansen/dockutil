@@ -134,4 +134,45 @@ final class FileLogTests: XCTestCase {
         log.write(.info, "attack")
         XCTAssertEqual(try String(contentsOfFile: victim, encoding: .utf8), "keep\n")
     }
+
+    func testDefaultPathIsDayNestedUnderTheSharedRoot() {
+        let day = FileLog.dayName(Date(timeIntervalSince1970: 1_772_000_000))
+        XCTAssertEqual(day.count, 10)
+        // The shared root only exists on a managed Mac, so assert the shape the
+        // path takes when it does rather than which branch this machine follows.
+        XCTAssertEqual(FileLog.eventsPath(besides: "/x/2026-09-03/dockutil.log"), "/x/2026-09-03/events.jsonl")
+    }
+
+    func testEveryRecordIsAlsoWrittenToTheEventStream() throws {
+        let log = FileLog(path: logPath, tool: "dockutil")
+        log.info("dock rebuilt")
+        log.error("could not read the dock")
+
+        let events = try String(contentsOfFile: directory.appendingPathComponent("events.jsonl").path, encoding: .utf8)
+            .split(separator: "\n").map(String.init)
+        XCTAssertEqual(events.count, 2)
+        let first = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(events[0].utf8)) as? [String: String])
+        XCTAssertEqual(first["tool"], "dockutil")
+        XCTAssertEqual(first["level"], "INFO")
+        XCTAssertEqual(first["message"], "dock rebuilt")
+        XCTAssertEqual(first["pid"], String(getpid()))
+        let second = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(events[1].utf8)) as? [String: String])
+        XCTAssertEqual(second["event_type"], "error")
+        // One invocation writes one invocation id.
+        XCTAssertEqual(first["invocation_id"], second["invocation_id"])
+    }
+
+    func testRetentionRemovesDayDirectoriesPastTheWindow() throws {
+        let fm = FileManager.default
+        let now = Date(timeIntervalSince1970: 1_772_000_000)
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        for day in ["2026-01-01", FileLog.dayName(now)] {
+            try fm.createDirectory(at: directory.appendingPathComponent(day), withIntermediateDirectories: true)
+        }
+
+        let removed = FileLog.pruneDayDirectories(in: directory.path, now: now)
+
+        XCTAssertEqual(removed, 1)
+        XCTAssertEqual(try fm.contentsOfDirectory(atPath: directory.path), [FileLog.dayName(now)])
+    }
 }
