@@ -142,32 +142,70 @@ public final class FileLog: @unchecked Sendable {
     }
 
     /// Removes day directories under `rootDirectory` older than the retention
-    /// window. Best-effort: in the shared sticky root another context's
-    /// directories are not this process's to remove.
+    /// window, and entries root set aside. Best-effort: in the shared sticky
+    /// root another context's directories are not this process's to remove.
+    /// Nothing here deletes recursively or follows a link; see `removeEntryNoFollow`.
     @discardableResult
     public static func pruneDayDirectories(in directory: String = rootDirectory, now: Date = Date()) -> Int {
-        let fm = FileManager.default
-        guard let entries = try? fm.contentsOfDirectory(atPath: directory),
-              let cutoff = Calendar.current.date(byAdding: .day, value: -retentionDays, to: now) else { return 0 }
+        guard let cutoff = Calendar.current.date(byAdding: .day, value: -retentionDays, to: now) else { return 0 }
+        let root = open(directory, O_RDONLY | O_DIRECTORY)
+        guard root >= 0 else { return 0 }
+        defer { close(root) }
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         f.timeZone = TimeZone.current
         f.dateFormat = "yyyy-MM-dd"
         var removed = 0
-        for entry in entries {
+        for entry in directoryEntryNames(root) {
             if let setAsideAt = untrustedDate(entry) {
-                if setAsideAt < cutoff, removeWithoutFollowing((directory as NSString).appendingPathComponent(entry)) {
-                    removed += 1
-                }
+                if setAsideAt < cutoff, removeEntryNoFollow(entry, in: root) { removed += 1 }
                 continue
             }
-            guard let day = f.date(from: entry), day < cutoff else { continue }
-            let full = (directory as NSString).appendingPathComponent(entry)
-            var isDirectory: ObjCBool = false
-            guard fm.fileExists(atPath: full, isDirectory: &isDirectory), isDirectory.boolValue else { continue }
-            if (try? fm.removeItem(atPath: full)) != nil { removed += 1 }
+            guard let day = f.date(from: entry), day < cutoff, isDirectoryEntry(entry, in: root) else { continue }
+            if removeEntryNoFollow(entry, in: root) { removed += 1 }
         }
         return removed
+    }
+
+    /// Names in the directory open at `fd`, without "." and "..".
+    static func directoryEntryNames(_ fd: Int32) -> [String] {
+        let copy = dup(fd)
+        guard copy >= 0 else { return [] }
+        guard let dir = fdopendir(copy) else { close(copy); return [] }
+        defer { closedir(dir) }
+        rewinddir(dir)
+        var names: [String] = []
+        while let entry = readdir(dir) {
+            let name = withUnsafeBytes(of: entry.pointee.d_name) { bytes in
+                String(cString: bytes.bindMemory(to: CChar.self).baseAddress!)
+            }
+            if name != "." && name != ".." { names.append(name) }
+        }
+        return names
+    }
+
+    /// True when `name` in the directory open at `fd` is a real directory, not a link.
+    static func isDirectoryEntry(_ name: String, in fd: Int32) -> Bool {
+        var info = stat()
+        return fstatat(fd, name, &info, AT_SYMLINK_NOFOLLOW) == 0 && (info.st_mode & S_IFMT) == S_IFDIR
+    }
+
+    /// Removes `name` from the directory open at `parent` without following a
+    /// link. A link or file is unlinked. A directory is opened with O_NOFOLLOW,
+    /// its files and links unlinked, and it is removed only once it is empty;
+    /// a folder nested inside it is left in place. Returns true when the entry is gone.
+    @discardableResult
+    static func removeEntryNoFollow(_ name: String, in parent: Int32) -> Bool {
+        var info = stat()
+        guard fstatat(parent, name, &info, AT_SYMLINK_NOFOLLOW) == 0 else { return false }
+        guard (info.st_mode & S_IFMT) == S_IFDIR else { return unlinkat(parent, name, 0) == 0 }
+        let fd = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        guard fd >= 0 else { return false }
+        for child in directoryEntryNames(fd) where !isDirectoryEntry(child, in: fd) {
+            unlinkat(fd, child, 0)
+        }
+        close(fd)
+        return unlinkat(parent, name, AT_REMOVEDIR) == 0
     }
 
     public static func userPath(tool: String) -> String {
@@ -322,17 +360,6 @@ public final class FileLog: @unchecked Sendable {
         return Date(timeIntervalSince1970: TimeInterval(epoch))
     }
 
-    /// Removes `path` without following it: a link or file is unlinked, a real
-    /// directory removed with its contents.
-    static func removeWithoutFollowing(_ path: String) -> Bool {
-        var info = stat()
-        guard lstat(path, &info) == 0 else { return false }
-        if (info.st_mode & S_IFMT) == S_IFDIR {
-            return (try? FileManager.default.removeItem(atPath: path)) != nil
-        }
-        return unlink(path) == 0
-    }
-
     @discardableResult
     private func ensureDirectory(for target: String) -> Bool {
         let directory = (target as NSString).deletingLastPathComponent
@@ -419,25 +446,21 @@ public final class FileLog: @unchecked Sendable {
         return FileLog.isRoot || info.st_uid == geteuid()
     }
 
+    /// Shifts the generations up by one. unlink and rename never follow a
+    /// link, and unlink refuses a directory, so nothing here walks into an
+    /// entry another account placed in the shared root.
     private func rotate(_ target: String) {
-        let manager = FileManager.default
         guard generations > 0 else {
-            try? manager.removeItem(atPath: target)
+            unlink(target)
             return
         }
-        let oldest = "\(target).\(generations)"
-        if manager.fileExists(atPath: oldest) {
-            try? manager.removeItem(atPath: oldest)
-        }
+        unlink("\(target).\(generations)")
         if generations > 1 {
             for index in stride(from: generations - 1, through: 1, by: -1) {
-                let from = "\(target).\(index)"
-                if manager.fileExists(atPath: from) {
-                    try? manager.moveItem(atPath: from, toPath: "\(target).\(index + 1)")
-                }
+                rename("\(target).\(index)", "\(target).\(index + 1)")
             }
         }
-        try? manager.moveItem(atPath: target, toPath: "\(target).1")
+        rename(target, "\(target).1")
     }
 }
 
