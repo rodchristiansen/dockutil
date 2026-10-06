@@ -91,9 +91,10 @@ final class FileLogTests: XCTestCase {
     }
 
     func testDefaultPathPrefersWritableSharedDirectory() {
-        let path = FileLog.defaultPath(tool: "tool")
+        let date = Date()
+        let path = FileLog.defaultPath(tool: "tool", date: date)
         if FileLog.sharedDirectoryIsWritable() {
-            XCTAssertEqual(path, "/Library/Managed Utilities/logs/tool.log")
+            XCTAssertEqual(path, "/Library/Managed Utilities/logs/\(FileLog.dayName(date))/tool.log")
         } else {
             XCTAssertEqual(path, FileLog.userPath(tool: "tool"))
             XCTAssertTrue(path.hasSuffix("/Library/Logs/tool.log"))
@@ -174,5 +175,38 @@ final class FileLogTests: XCTestCase {
 
         XCTAssertEqual(removed, 1)
         XCTAssertEqual(try fm.contentsOfDirectory(atPath: directory.path), [FileLog.dayName(now)])
+    }
+
+    func testSymlinkPlantedUnderTheDayNameIsNotFollowedOrChanged() throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        let elsewhere = directory.appendingPathComponent("elsewhere", isDirectory: true)
+        try fm.createDirectory(at: elsewhere, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        let day = directory.appendingPathComponent("2026-10-06").path
+        try fm.createSymbolicLink(atPath: day, withDestinationPath: elsewhere.path)
+
+        XCTAssertFalse(FileLog.makeSharedDirectory(day))
+        let mode = ((try fm.attributesOfItem(atPath: elsewhere.path)[.posixPermissions] as? Int) ?? 0) & 0o7777
+        XCTAssertEqual(mode, 0o700)
+        XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: day), elsewhere.path)
+    }
+
+    func testAnExistingDayDirectoryKeepsItsMode() throws {
+        let fm = FileManager.default
+        let day = directory.appendingPathComponent("2026-10-06", isDirectory: true)
+        try fm.createDirectory(at: day, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])
+
+        XCTAssertTrue(FileLog.makeSharedDirectory(day.path))
+        let mode = ((try fm.attributesOfItem(atPath: day.path)[.posixPermissions] as? Int) ?? 0) & 0o7777
+        XCTAssertEqual(mode, 0o755)
+    }
+
+    func testANewDayDirectoryIsCreatedShared() throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let day = directory.appendingPathComponent("2026-10-06").path
+
+        XCTAssertTrue(FileLog.makeSharedDirectory(day))
+        let mode = ((try FileManager.default.attributesOfItem(atPath: day)[.posixPermissions] as? Int) ?? 0) & 0o7777
+        XCTAssertEqual(mode, Int(FileLog.sharedDirectoryMode))
     }
 }
