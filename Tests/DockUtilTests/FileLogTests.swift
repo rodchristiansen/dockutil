@@ -250,11 +250,40 @@ final class FileLogTests: XCTestCase {
         let dir = directory.appendingPathComponent(FileLog.untrustedName(day: "2026-01-02", pid: 2, now: old))
         let recent = FileLog.untrustedName(day: "2026-02-24", pid: 3, now: now)
         try fm.createSymbolicLink(atPath: link, withDestinationPath: target.path)
-        try fm.createDirectory(at: dir.appendingPathComponent("inner"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        fm.createFile(atPath: dir.appendingPathComponent("dockutil.log").path, contents: Data("x".utf8))
         try fm.createDirectory(at: directory.appendingPathComponent(recent), withIntermediateDirectories: false)
 
         XCTAssertEqual(FileLog.pruneDayDirectories(in: directory.path, now: now), 2)
         XCTAssertEqual(Set(try fm.contentsOfDirectory(atPath: directory.path)), ["target", recent])
         XCTAssertTrue(fm.fileExists(atPath: target.appendingPathComponent("keep").path))
+    }
+
+    func testRetentionUnlinksALinkInsideAnExpiredDayAndItsTargetSurvives() throws {
+        let fm = FileManager.default
+        let now = Date(timeIntervalSince1970: 1_772_000_000)
+        let target = directory.appendingPathComponent("target", isDirectory: true)
+        try fm.createDirectory(at: target, withIntermediateDirectories: true)
+        fm.createFile(atPath: target.appendingPathComponent("keep").path, contents: Data("x".utf8))
+        let day = directory.appendingPathComponent("2026-01-01", isDirectory: true)
+        try fm.createDirectory(at: day, withIntermediateDirectories: true)
+        fm.createFile(atPath: day.appendingPathComponent("dockutil.log").path, contents: Data("x".utf8))
+        try fm.createSymbolicLink(atPath: day.appendingPathComponent("link").path, withDestinationPath: target.path)
+
+        XCTAssertEqual(FileLog.pruneDayDirectories(in: directory.path, now: now), 1)
+        XCTAssertEqual(try fm.contentsOfDirectory(atPath: directory.path), ["target"])
+        XCTAssertTrue(fm.fileExists(atPath: target.appendingPathComponent("keep").path))
+    }
+
+    func testRetentionLeavesAFolderNestedInsideAnExpiredDay() throws {
+        let fm = FileManager.default
+        let now = Date(timeIntervalSince1970: 1_772_000_000)
+        let day = directory.appendingPathComponent("2026-01-01", isDirectory: true)
+        try fm.createDirectory(at: day.appendingPathComponent("nested"), withIntermediateDirectories: true)
+        fm.createFile(atPath: day.appendingPathComponent("dockutil.log").path, contents: Data("x".utf8))
+
+        XCTAssertEqual(FileLog.pruneDayDirectories(in: directory.path, now: now), 0)
+        XCTAssertTrue(fm.fileExists(atPath: day.appendingPathComponent("nested").path))
+        XCTAssertFalse(fm.fileExists(atPath: day.appendingPathComponent("dockutil.log").path))
     }
 }
