@@ -179,7 +179,7 @@ public final class FileLog: @unchecked Sendable {
             ensureSharedDirectory()
         }
         var info = stat()
-        guard stat(rootDirectory, &info) == 0, (info.st_mode & S_IFMT) == S_IFDIR else { return false }
+        guard lstat(rootDirectory, &info) == 0, (info.st_mode & S_IFMT) == S_IFDIR, info.st_uid == 0 else { return false }
         return access(rootDirectory, W_OK | X_OK) == 0
     }
 
@@ -188,8 +188,9 @@ public final class FileLog: @unchecked Sendable {
     public static func ensureSharedDirectory() {
         guard isRoot else { return }
         var info = stat()
-        if stat(rootDirectory, &info) == 0 {
-            if (info.st_mode & S_IFMT) == S_IFDIR, (info.st_mode & 0o7777) != sharedDirectoryMode {
+        if lstat(rootDirectory, &info) == 0 {
+            // Only a real directory root already owns is restored; anything else is left alone.
+            if (info.st_mode & S_IFMT) == S_IFDIR, info.st_uid == 0, (info.st_mode & 0o7777) != sharedDirectoryMode {
                 chmod(rootDirectory, sharedDirectoryMode)
             }
             return
@@ -270,11 +271,30 @@ public final class FileLog: @unchecked Sendable {
 
     // MARK: - File handling
 
-    private func ensureDirectory(for target: String) {
+    /// Makes the shared day directory at `path` when it is missing. An existing
+    /// entry is never followed or re-moded: it is used only when it is a real
+    /// directory owned by root or this process, and only a directory this
+    /// process just created is widened to the shared mode.
+    static func makeSharedDirectory(_ path: String) -> Bool {
+        var info = stat()
+        if lstat(path, &info) == 0 {
+            guard (info.st_mode & S_IFMT) == S_IFDIR else { return false }
+            guard info.st_uid == 0 || info.st_uid == geteuid() else { return false }
+            return access(path, W_OK | X_OK) == 0
+        }
+        guard mkdir(path, sharedDirectoryMode) == 0 else { return false }
+        // The sticky root stops other accounts renaming what this process just made.
+        chmod(path, sharedDirectoryMode)
+        if isRoot { chown(path, 0, 0) }
+        return access(path, W_OK | X_OK) == 0
+    }
+
+    @discardableResult
+    private func ensureDirectory(for target: String) -> Bool {
         let directory = (target as NSString).deletingLastPathComponent
         if directory == FileLog.rootDirectory {
             FileLog.ensureSharedDirectory()
-            return
+            return true
         }
         // A day directory inside the shared root is created world-writable and
         // sticky like the root itself, by whichever context gets there first,
@@ -282,21 +302,13 @@ public final class FileLog: @unchecked Sendable {
         // runs once per process, the first time it needs the directory.
         if (directory as NSString).deletingLastPathComponent == FileLog.rootDirectory {
             FileLog.ensureSharedDirectory()
-            var info = stat()
-            if stat(directory, &info) != 0 {
-                if mkdir(directory, FileLog.sharedDirectoryMode) == 0 {
-                    chmod(directory, FileLog.sharedDirectoryMode)
-                    if FileLog.isRoot { chown(directory, 0, 0) }
-                }
-            } else if (info.st_mode & 0o7777) != FileLog.sharedDirectoryMode, info.st_uid == geteuid() {
-                chmod(directory, FileLog.sharedDirectoryMode)
-            }
+            let usable = FileLog.makeSharedDirectory(directory)
             FileLog.pruneOnce()
-            return
+            return usable
         }
         var isDirectory: ObjCBool = false
         if FileManager.default.fileExists(atPath: directory, isDirectory: &isDirectory), isDirectory.boolValue {
-            return
+            return true
         }
         var attributes: [FileAttributeKey: Any] = [.posixPermissions: 0o755]
         if FileLog.isRoot {
@@ -304,13 +316,13 @@ public final class FileLog: @unchecked Sendable {
             attributes[.groupOwnerAccountID] = 0
         }
         try? FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true, attributes: attributes)
+        return true
     }
 
     /// Appends `data` to `target`. Returns false when the file could not be
     /// opened or is not a plain, single-linked regular file.
     private func append(_ data: Data, to target: String) -> Bool {
-        ensureDirectory(for: target)
-        guard var descriptor = openForAppend(target) else { return false }
+        guard ensureDirectory(for: target), var descriptor = openForAppend(target) else { return false }
         let size = Int(lseek(descriptor, 0, SEEK_END))
         if size > 0 && size + data.count > maxBytes && mayRotate(descriptor) {
             close(descriptor)
