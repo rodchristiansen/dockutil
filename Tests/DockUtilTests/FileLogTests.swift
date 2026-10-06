@@ -185,10 +185,14 @@ final class FileLogTests: XCTestCase {
         let day = directory.appendingPathComponent("2026-10-06").path
         try fm.createSymbolicLink(atPath: day, withDestinationPath: elsewhere.path)
 
-        XCTAssertFalse(FileLog.makeSharedDirectory(day))
+        // Root sets the entry aside and makes its own day; any other account stays off it.
+        XCTAssertEqual(FileLog.makeSharedDirectory(day), geteuid() == 0)
         let mode = ((try fm.attributesOfItem(atPath: elsewhere.path)[.posixPermissions] as? Int) ?? 0) & 0o7777
         XCTAssertEqual(mode, 0o700)
-        XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: day), elsewhere.path)
+        if geteuid() != 0 {
+            XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: day), elsewhere.path)
+        }
+        XCTAssertEqual(try fm.contentsOfDirectory(atPath: elsewhere.path), [])
     }
 
     func testAnExistingDayDirectoryKeepsItsMode() throws {
@@ -208,5 +212,49 @@ final class FileLogTests: XCTestCase {
         XCTAssertTrue(FileLog.makeSharedDirectory(day))
         let mode = ((try FileManager.default.attributesOfItem(atPath: day)[.posixPermissions] as? Int) ?? 0) & 0o7777
         XCTAssertEqual(mode, Int(FileLog.sharedDirectoryMode))
+    }
+
+    func testSetAsideNameCarriesTheTimeItWasSetAside() {
+        let now = Date(timeIntervalSince1970: 1_790_000_000)
+        let name = FileLog.untrustedName(day: "2026-10-06", pid: 42, now: now)
+        XCTAssertEqual(name, ".untrusted-2026-10-06-42-1790000000")
+        XCTAssertEqual(FileLog.untrustedDate(name), now)
+        XCTAssertNil(FileLog.untrustedDate("2026-10-06"))
+        XCTAssertNil(FileLog.untrustedDate(".untrusted-junk"))
+    }
+
+    func testRootSetsAsideADayDirectoryItDoesNotOwn() throws {
+        try XCTSkipUnless(geteuid() == 0, "needs root")
+        let fm = FileManager.default
+        let day = directory.appendingPathComponent("2026-10-06").path
+        try fm.createDirectory(atPath: day, withIntermediateDirectories: true)
+        chown(day, 4_294_967_294, 4_294_967_294)
+
+        XCTAssertTrue(FileLog.makeSharedDirectory(day))
+        var info = stat()
+        XCTAssertEqual(lstat(day, &info), 0)
+        XCTAssertEqual(info.st_uid, 0)
+        XCTAssertEqual(info.st_mode & 0o7777, FileLog.sharedDirectoryMode)
+        let entries = try fm.contentsOfDirectory(atPath: directory.path)
+        XCTAssertEqual(entries.filter { $0.hasPrefix(FileLog.untrustedPrefix) }.count, 1)
+    }
+
+    func testRetentionRemovesSetAsideEntriesWithoutFollowingThem() throws {
+        let fm = FileManager.default
+        let now = Date(timeIntervalSince1970: 1_772_000_000)
+        let old = now.addingTimeInterval(-60 * 24 * 60 * 60)
+        let target = directory.appendingPathComponent("target", isDirectory: true)
+        try fm.createDirectory(at: target, withIntermediateDirectories: true)
+        fm.createFile(atPath: target.appendingPathComponent("keep").path, contents: Data("x".utf8))
+        let link = directory.appendingPathComponent(FileLog.untrustedName(day: "2026-01-01", pid: 1, now: old)).path
+        let dir = directory.appendingPathComponent(FileLog.untrustedName(day: "2026-01-02", pid: 2, now: old))
+        let recent = FileLog.untrustedName(day: "2026-02-24", pid: 3, now: now)
+        try fm.createSymbolicLink(atPath: link, withDestinationPath: target.path)
+        try fm.createDirectory(at: dir.appendingPathComponent("inner"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: directory.appendingPathComponent(recent), withIntermediateDirectories: false)
+
+        XCTAssertEqual(FileLog.pruneDayDirectories(in: directory.path, now: now), 2)
+        XCTAssertEqual(Set(try fm.contentsOfDirectory(atPath: directory.path)), ["target", recent])
+        XCTAssertTrue(fm.fileExists(atPath: target.appendingPathComponent("keep").path))
     }
 }

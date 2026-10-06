@@ -155,6 +155,12 @@ public final class FileLog: @unchecked Sendable {
         f.dateFormat = "yyyy-MM-dd"
         var removed = 0
         for entry in entries {
+            if let setAsideAt = untrustedDate(entry) {
+                if setAsideAt < cutoff, removeWithoutFollowing((directory as NSString).appendingPathComponent(entry)) {
+                    removed += 1
+                }
+                continue
+            }
             guard let day = f.date(from: entry), day < cutoff else { continue }
             let full = (directory as NSString).appendingPathComponent(entry)
             var isDirectory: ObjCBool = false
@@ -274,19 +280,57 @@ public final class FileLog: @unchecked Sendable {
     /// Makes the shared day directory at `path` when it is missing. An existing
     /// entry is never followed or re-moded: it is used only when it is a real
     /// directory owned by root or this process, and only a directory this
-    /// process just created is widened to the shared mode.
+    /// process just created is widened to the shared mode. Root sets aside
+    /// anything else under the day's name and makes its own, so root records
+    /// stay in the collected location.
     static func makeSharedDirectory(_ path: String) -> Bool {
         var info = stat()
         if lstat(path, &info) == 0 {
-            guard (info.st_mode & S_IFMT) == S_IFDIR else { return false }
-            guard info.st_uid == 0 || info.st_uid == geteuid() else { return false }
-            return access(path, W_OK | X_OK) == 0
+            let trusted = (info.st_mode & S_IFMT) == S_IFDIR && (info.st_uid == 0 || info.st_uid == geteuid())
+            if trusted { return access(path, W_OK | X_OK) == 0 }
+            guard isRoot, setAside(path) else { return false }
         }
         guard mkdir(path, sharedDirectoryMode) == 0 else { return false }
         // The sticky root stops other accounts renaming what this process just made.
         chmod(path, sharedDirectoryMode)
         if isRoot { chown(path, 0, 0) }
         return access(path, W_OK | X_OK) == 0
+    }
+
+    /// Renames `path` to a hidden name beside it. rename never follows a link,
+    /// and root may rename any entry in a root-owned parent. Only done when the
+    /// parent is a real directory owned by root.
+    static func setAside(_ path: String, now: Date = Date()) -> Bool {
+        let parent = (path as NSString).deletingLastPathComponent
+        var info = stat()
+        guard lstat(parent, &info) == 0, (info.st_mode & S_IFMT) == S_IFDIR, info.st_uid == 0 else { return false }
+        let name = untrustedName(day: (path as NSString).lastPathComponent, pid: getpid(), now: now)
+        return rename(path, (parent as NSString).appendingPathComponent(name)) == 0
+    }
+
+    static let untrustedPrefix = ".untrusted-"
+
+    /// The hidden name an entry set aside by `setAside` gets.
+    static func untrustedName(day: String, pid: Int32, now: Date) -> String {
+        return "\(untrustedPrefix)\(day)-\(pid)-\(Int(now.timeIntervalSince1970))"
+    }
+
+    /// When an entry named by `untrustedName` was set aside, or nil for any other name.
+    static func untrustedDate(_ name: String) -> Date? {
+        guard name.hasPrefix(untrustedPrefix), let last = name.split(separator: "-").last,
+              let epoch = Int(last) else { return nil }
+        return Date(timeIntervalSince1970: TimeInterval(epoch))
+    }
+
+    /// Removes `path` without following it: a link or file is unlinked, a real
+    /// directory removed with its contents.
+    static func removeWithoutFollowing(_ path: String) -> Bool {
+        var info = stat()
+        guard lstat(path, &info) == 0 else { return false }
+        if (info.st_mode & S_IFMT) == S_IFDIR {
+            return (try? FileManager.default.removeItem(atPath: path)) != nil
+        }
+        return unlink(path) == 0
     }
 
     @discardableResult
